@@ -694,6 +694,7 @@ class InferenceManager:
         # Async options
         use_async: bool = True,
         async_depth: int = 4,
+        reuse_input_buffer: bool = False,
     ):
         """Configure inference parameters. Must be called before using InferenceManager.
 
@@ -786,6 +787,13 @@ class InferenceManager:
         async_depth : int, default=4
             Maximum number of pending async copies before blocking. Higher values
             can improve throughput but increase memory usage for pinned buffers.
+
+        reuse_input_buffer : bool, default=False
+            Reuse the first input tensor as output storage when its shape and dtype
+            exactly match the output. The caller must ensure batches are independent,
+            because completed input slices are overwritten. OOM recovery is disabled
+            after the first slice is committed so partially overwritten input is
+            never retried silently.
         """
         self.min_batch_size = int(min_batch_size)
         self.safety_factor = float(safety_factor)
@@ -810,6 +818,7 @@ class InferenceManager:
         # Async settings
         self.use_async = bool(use_async)
         self.async_depth = max(1, int(async_depth))
+        self.reuse_input_buffer = bool(reuse_input_buffer)
 
         # Normalize offload mode
         self.offload_mode = self._normalize_offload(offload)
@@ -1320,6 +1329,27 @@ class InferenceManager:
                     return forward_fn(**inputs)
             return forward_fn(**inputs)
 
+    def _reusable_input_buffer(
+        self,
+        first_value: Tensor,
+        output_shape: Tuple[int, ...],
+        input_dtype: torch.dtype,
+        output_repeat: int,
+    ) -> Optional[Tensor]:
+        """Return the first input when it can safely provide output storage.
+
+        This only establishes storage compatibility. The caller is responsible for
+        enabling this option exclusively for transforms whose leading-dimension
+        batches are independent (TabAbax Row1 and Col2).
+        """
+        if not self.reuse_input_buffer or output_repeat != 1:
+            return None
+        if first_value.requires_grad:
+            return None
+        if tuple(first_value.shape) != tuple(output_shape) or first_value.dtype != input_dtype:
+            return None
+        return first_value
+
     def __call__(
         self,
         forward_fn: Callable[..., Tensor],
@@ -1412,6 +1442,12 @@ class InferenceManager:
             output_shape = (*batch_dims, self.out_dim)
         else:
             output_shape = (*batch_dims, seq_len, self.out_dim)
+        reusable_outputs = self._reusable_input_buffer(
+            first_value,
+            tuple(output_shape),
+            input_dtype,
+            output_repeat,
+        )
 
         # Estimate output size
         output_mb = self._estimate_tensor_mb(tuple(output_shape), input_dtype, repeat=output_repeat)
@@ -1456,6 +1492,8 @@ class InferenceManager:
             # PATCH: log when auto moved the stored output off GPU
             if downgrade_reason:
                 print(f"Offload adjusted: mode={mode.name} ({downgrade_reason})")
+            if reusable_outputs is not None:
+                print("Output storage: reusing the first input buffer in-place")
             ################################################################################
 
         # Single batch case. A full forward that does not fit falls through to sliced batches.
@@ -1470,7 +1508,7 @@ class InferenceManager:
                 self._empty_backend_cache()
                 if total_bs <= self.min_batch_size:
                     raise
-                if self._can_promote_oom_to_disk(mode, disk_promoted=False):
+                if reusable_outputs is None and self._can_promote_oom_to_disk(mode, disk_promoted=False):
                     mode = OffloadMode.DISK
                     if self.verbose:
                         print("Single-batch OOM under auto, moving stored output to disk and slicing batches")
@@ -1481,6 +1519,11 @@ class InferenceManager:
             # PATCH END
             ################################################################################
             else:
+                if reusable_outputs is not None:
+                    reusable_outputs.copy_(
+                        out.to(device=reusable_outputs.device, dtype=reusable_outputs.dtype)
+                    )
+                    return reusable_outputs
                 if mode == OffloadMode.GPU:
                     return out
                 if mode == OffloadMode.CPU:
@@ -1498,11 +1541,15 @@ class InferenceManager:
         # PATCH: comment only. The allocation below is original. disk_promoted is new.
         # Multi-batch execution. disk_promoted flips at most once after a real OOM.
         ################################################################################
-        outputs, _ = self._allocate_output_buffer(mode, tuple(output_shape), input_dtype)
+        reuse_active = reusable_outputs is not None
+        if reuse_active:
+            outputs = reusable_outputs
+        else:
+            outputs, _ = self._allocate_output_buffer(mode, tuple(output_shape), input_dtype)
 
         # Setup async copy manager if using async and offloading
         async_copy: Optional[AsyncCopyManager] = None
-        if self.use_async and mode != OffloadMode.GPU:
+        if self.use_async and mode != OffloadMode.GPU and not reuse_active:
             async_copy = AsyncCopyManager(
                 self.exe_device,
                 max_pending=self.async_depth,
@@ -1520,6 +1567,7 @@ class InferenceManager:
         # PATCH: already on disk means this loop must not promote again
         disk_promoted = mode == OffloadMode.DISK
         ################################################################################
+        reused_slices_written = False
         while True:
             try:
                 split_sizes = self.compute_split_sizes(batch_dims, batch_size)
@@ -1549,7 +1597,12 @@ class InferenceManager:
                                 original_cache.preallocate(batch_cache, tuple(batch_dims), device=self.exe_device)
                             original_cache[indices] = batch_cache
 
-                    if mode == OffloadMode.GPU:
+                    if reuse_active:
+                        outputs[indices].copy_(
+                            out.to(device=outputs.device, dtype=outputs.dtype)
+                        )
+                        reused_slices_written = True
+                    elif mode == OffloadMode.GPU:
                         outputs[indices] = out
                     else:
                         if async_copy is not None:
@@ -1588,6 +1641,14 @@ class InferenceManager:
                 if async_copy is not None:
                     async_copy.clear()
 
+                if reuse_active and reused_slices_written:
+                    raise RuntimeError(
+                        "CUDA OOM after an in-place output slice was committed. "
+                        "The input buffer is partially overwritten, so retry is refused "
+                        "to preserve inference correctness. Re-run the full forward with "
+                        "a smaller batch or a lower safety_factor."
+                    ) from e
+
                 # Clear pre-allocated cache entries before retry
                 for cache_key in store_cache_keys:
                     inputs[cache_key].kv.clear()
@@ -1598,7 +1659,7 @@ class InferenceManager:
                 ################################################################################
                 # The full output buffer is what auto left on GPU. Drop it to disk once
                 # before giving up, including when the batch is already at its minimum.
-                if self._can_promote_oom_to_disk(mode, disk_promoted):
+                if not reuse_active and self._can_promote_oom_to_disk(mode, disk_promoted):
                     disk_promoted = True
                     del outputs
                     self._empty_backend_cache()

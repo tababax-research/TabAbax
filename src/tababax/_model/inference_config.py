@@ -73,6 +73,8 @@ class MgrConfig:
     - ``use_async``: Use async device-to-host transfers with backend stream/event
       primitives when available (falls back to synchronous copy otherwise).
     - ``async_depth``: Max pending async copies before blocking.
+    - ``reuse_input_buffer``: Reuse a shape-compatible first input as the output
+      buffer. This is intended for transforms whose batches are independent.
     """
 
     _ALLOWED_KEYS = {
@@ -101,6 +103,7 @@ class MgrConfig:
         # Async transfer
         "use_async",
         "async_depth",
+        "reuse_input_buffer",
     }
     _TYPE_SPECS = {
         # General
@@ -179,6 +182,11 @@ class MgrConfig:
             "expected_type": int,
             "validator": lambda x: x >= 1,
             "error_msg": "async_depth must be an integer >= 1",
+        },
+        "reuse_input_buffer": {
+            "expected_type": bool,
+            "validator": None,
+            "error_msg": "reuse_input_buffer must be a boolean",
         },
     }
 
@@ -291,6 +299,7 @@ class InferenceConfig:
                 # Async transfer
                 use_async=True,
                 async_depth=4,
+                reuse_input_buffer=False,
             )
         elif not isinstance(self.COL_CONFIG, MgrConfig):
             raise TypeError(f"COL_CONFIG must be a dict or MgrConfig, got {type(self.COL_CONFIG)}")
@@ -324,6 +333,7 @@ class InferenceConfig:
                 # Async transfer
                 use_async=True,
                 async_depth=4,
+                reuse_input_buffer=False,
             )
         elif not isinstance(self.ROW_CONFIG, MgrConfig):
             raise TypeError(f"ROW_CONFIG must be a dict or MgrConfig, got {type(self.ROW_CONFIG)}")
@@ -357,6 +367,7 @@ class InferenceConfig:
                 # Async transfer
                 use_async=True,
                 async_depth=4,
+                reuse_input_buffer=False,
             )
         elif not isinstance(self.ICL_CONFIG, MgrConfig):
             raise TypeError(f"ICL_CONFIG must be a dict or MgrConfig, got {type(self.ICL_CONFIG)}")
